@@ -1,11 +1,11 @@
-name = "pos-multi-tenant-api"
+name = "pos-api"
 main = "worker.js"
 compatibility_date = "2024-09-01"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "pos_multi_tenant"
-database_id = "<ISI_DENGAN_ID_DATABASE_D1_ANDA>"
+database_name = "pos-db"
+database_id = "7073997b-8b46-4a84-bcdb-e0103c283d20"
 
 # Setelah membuat database:
 #   wrangler d1 create pos_multi_tenant
