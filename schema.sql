@@ -19,6 +19,9 @@
 --   payment              -> catatan pembayaran (tunai/QRIS) per transaksi
 -- ============================================================
 
+DROP TABLE IF EXISTS jurnal_detail;
+DROP TABLE IF EXISTS jurnal;
+DROP TABLE IF EXISTS akun;
 DROP TABLE IF EXISTS payment;
 DROP TABLE IF EXISTS transaksi_produk;
 DROP TABLE IF EXISTS transaksi;
@@ -172,6 +175,52 @@ CREATE TABLE payment (
 CREATE INDEX idx_payment_tenant ON payment(tenantId);
 CREATE INDEX idx_payment_transaksi ON payment(transaksiId);
 
+-- ---------------------------------------------------------------
+-- MODUL KEUANGAN — akun (bagan akun/COA), jurnal + jurnal_detail
+-- (jurnal umum, pola header+baris SAMA seperti transaksi/distribusi).
+-- Tidak ada tabel neraca/laba-rugi/ekuitas tersendiri: ketiganya
+-- SELALU dihitung real-time dari akun + jurnal_detail di pages/laporan.js
+-- (satu sumber kebenaran, tidak ada data laporan yang disimpan ganda).
+-- ---------------------------------------------------------------
+CREATE TABLE akun (
+  id          TEXT PRIMARY KEY,
+  tenantId    TEXT NOT NULL,
+  kode        TEXT NOT NULL,
+  nama        TEXT NOT NULL,
+  tipe        TEXT NOT NULL,             -- aset | kewajiban | ekuitas | pendapatan | beban
+  saldoNormal TEXT NOT NULL,             -- debit | kredit (turunan dari tipe, disimpan eksplisit)
+  saldoAwal   REAL DEFAULT 0,
+  aktif       INTEGER DEFAULT 1,
+  createdAt   TEXT NOT NULL
+);
+CREATE INDEX idx_akun_tenant ON akun(tenantId);
+
+CREATE TABLE jurnal (
+  id          TEXT PRIMARY KEY,
+  tenantId    TEXT NOT NULL,
+  nomor       TEXT,
+  tanggal     TEXT NOT NULL,
+  sumber      TEXT NOT NULL DEFAULT 'manual',  -- manual | transaksi | pembayaran
+  referensiId TEXT,                             -- id transaksi/payment terkait (opsional)
+  keterangan  TEXT,
+  status      TEXT NOT NULL DEFAULT 'posted',   -- posted (instan, sama seperti transaksi/distribusi)
+  createdAt   TEXT NOT NULL
+);
+CREATE INDEX idx_jurnal_tenant ON jurnal(tenantId);
+
+CREATE TABLE jurnal_detail (
+  id         TEXT PRIMARY KEY,
+  tenantId   TEXT NOT NULL,
+  jurnalId   TEXT NOT NULL,
+  akunId     TEXT NOT NULL,
+  debit      REAL DEFAULT 0,
+  kredit     REAL DEFAULT 0,
+  keterangan TEXT
+);
+CREATE INDEX idx_jd_tenant ON jurnal_detail(tenantId);
+CREATE INDEX idx_jd_jurnal ON jurnal_detail(jurnalId);
+CREATE INDEX idx_jd_akun ON jurnal_detail(akunId);
+
 -- ============================================================
 -- SEED DATA DEMO
 -- Tenant "system" (kodeToko SUPERADMIN) khusus untuk akun superadmin
@@ -207,3 +256,20 @@ INSERT INTO lokasi_produk (id, tenantId, lokasiId, produkId, stok, stokMinimum) 
 INSERT INTO kontak (id, tenantId, nama, tipe, telepon, alamat, email, createdAt) VALUES
  ('kon_sup1',  'tnt_demo', 'CV Sumber Pangan',     'supplier', '081300000001', 'Jl. Industri No. 10', 'sumberpangan@example.com', datetime('now')),
  ('kon_cust1', 'tnt_demo', 'Ibu Wati (Pelanggan)', 'customer', '081400000002', 'Jl. Kenanga No. 5',   '', datetime('now'));
+
+-- Bagan Akun (COA) demo untuk tnt_demo. Kode 1101/1103/1104/2101/4101/5101
+-- adalah kode BAKU yang dicari lewat kode (bukan id) oleh posting otomatis
+-- di pages/jurnal.js (jurnalPage.postingTransaksi) — kalau tenant lain
+-- membuat akunnya sendiri, kode-kode ini WAJIB dipakai ulang persis supaya
+-- posting otomatis dari transaksi jual/beli berfungsi.
+INSERT INTO akun (id, tenantId, kode, nama, tipe, saldoNormal, saldoAwal, aktif, createdAt) VALUES
+ ('akn_kas',      'tnt_demo', '1101', 'Kas',                        'aset',       'debit',  5000000, 1, datetime('now')),
+ ('akn_bank',     'tnt_demo', '1102', 'Bank',                       'aset',       'debit',  0,       1, datetime('now')),
+ ('akn_piutang',  'tnt_demo', '1103', 'Piutang Usaha (QRIS)',       'aset',       'debit',  0,       1, datetime('now')),
+ ('akn_persed',   'tnt_demo', '1104', 'Persediaan Barang Dagang',   'aset',       'debit',  3200000, 1, datetime('now')),
+ ('akn_utang',    'tnt_demo', '2101', 'Utang Usaha',                'kewajiban',  'kredit', 0,       1, datetime('now')),
+ ('akn_modal',    'tnt_demo', '3101', 'Modal Pemilik',              'ekuitas',    'kredit', 8200000, 1, datetime('now')),
+ ('akn_prive',    'tnt_demo', '3102', 'Prive Pemilik',              'ekuitas',    'debit',  0,       1, datetime('now')),
+ ('akn_jual',     'tnt_demo', '4101', 'Penjualan',                  'pendapatan', 'kredit', 0,       1, datetime('now')),
+ ('akn_hpp',      'tnt_demo', '5101', 'Harga Pokok Penjualan (HPP)','beban',      'debit',  0,       1, datetime('now')),
+ ('akn_beban_op', 'tnt_demo', '6101', 'Beban Operasional',          'beban',      'debit',  0,       1, datetime('now'));

@@ -43,6 +43,7 @@ const SCOPED_TABLES = new Set([
   'distribusi', 'distribusi_produk',
   'transaksi', 'transaksi_produk',
   'payment',
+  'akun', 'jurnal', 'jurnal_detail',
 ]);
 
 const TABLES = {
@@ -57,6 +58,9 @@ const TABLES = {
   transaksi:          { jsonCols: [] },
   transaksi_produk:   { jsonCols: [] },
   payment:            { jsonCols: [] },
+  akun:               { jsonCols: [] },
+  jurnal:             { jsonCols: [] },
+  jurnal_detail:      { jsonCols: [] },
 };
 
 function genId(table) {
