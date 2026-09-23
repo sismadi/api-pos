@@ -45,6 +45,9 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;      // 12 jam
 const PBKDF2_ITERATIONS = 100_000;
 const KODE_TOKO_RE = /^[A-Z0-9][A-Z0-9_-]{1,29}$/;
 const USERNAME_RE = /^[A-Za-z0-9._-]{3,40}$/;
+// [ECOMMERCE] Slug link publik toko, mis. https://pos.piawai.id/?toko/jaya
+// — huruf kecil/angka/strip/underscore saja, supaya aman dipakai di URL.
+const SLUG_RE = /^[a-z0-9][a-z0-9_-]{1,49}$/;
 
 const DEFAULT_ORIGINS = [
   'https://pos.piawai.id',
@@ -79,7 +82,7 @@ const WRITABLE_COLUMNS = {
   kontak:            ['nama', 'tipe', 'telepon', 'alamat', 'email'],
   distribusi:        ['nomor', 'tipe', 'tanggal', 'lokasiId', 'kontakId', 'status', 'catatan'],
   distribusi_produk: ['distribusiId', 'produkId', 'qty', 'hargaSatuan'],
-  transaksi:         ['nomor', 'tipe', 'tanggal', 'lokasiId', 'kontakId', 'status', 'metodePembayaran', 'totalBayar', 'catatan'],
+  transaksi:         ['nomor', 'tipe', 'tanggal', 'lokasiId', 'kontakId', 'status', 'metodePembayaran', 'totalBayar', 'catatan', 'pembeliNama', 'pembeliTelepon', 'pembeliAlamat'],
   transaksi_produk:  ['transaksiId', 'produkId', 'qty', 'hargaSatuan', 'subtotal'],
   payment:           ['transaksiId', 'metode', 'referensi', 'qrString', 'jumlah', 'status', 'paidAt'],
   akun:              ['kode', 'nama', 'tipe', 'saldoNormal', 'saldoAwal', 'aktif'],
@@ -325,6 +328,33 @@ function plainText(value, max) {
   return String(value ?? '').trim().slice(0, max);
 }
 
+// [ECOMMERCE] Validasi + jamin keunikan slug etalase publik. `excludeId`
+// dilewatkan saat UPDATE supaya tenant boleh menyimpan ulang slug yang
+// sama persis milik sendiri.
+async function normalizeSlug(db, raw, excludeId) {
+  const slug = String(raw ?? '').trim().toLowerCase();
+  if (!SLUG_RE.test(slug)) {
+    throw new HttpError(400, 'Slug toko harus 2-50 karakter: huruf kecil, angka, strip, atau underscore, diawali huruf/angka.');
+  }
+  const dupe = await db.prepare(`SELECT id FROM tenants WHERE slug = ? AND id != ?`).bind(slug, excludeId || '').first();
+  if (dupe) throw new HttpError(409, 'Slug toko sudah dipakai toko lain, gunakan slug lain.');
+  return slug;
+}
+
+/** Turunkan slug awal dari kodeToko saat tenant baru dibuat (register/superadmin),
+ *  supaya link toko langsung tersedia tanpa pemilik harus mengisi dulu.
+ *  Kalau bentrok (jarang, karena kodeToko sendiri unik), tambahkan sufiks acak. */
+async function autoSlugFromKodeToko(db, kodeToko) {
+  const base = kodeToko.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+/, '') || 'toko';
+  let candidate = base.slice(0, 50);
+  let n = 0;
+  while (await db.prepare(`SELECT id FROM tenants WHERE slug = ?`).bind(candidate).first()) {
+    n += 1;
+    candidate = `${base}-${n}`.slice(0, 50);
+  }
+  return candidate;
+}
+
 async function insertRow(db, table, record) {
   const cols = Object.keys(record);
   await db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
@@ -420,11 +450,15 @@ async function handleTenantsTable(request, env, id, session) {
   const isSuper = session.role === 'superadmin';
 
   if (method === 'GET') {
-    if (!isSuper) throw new HttpError(403, 'Hanya superadmin yang boleh melihat daftar tenant.');
     if (id) {
+      // [ECOMMERCE] Pemilik toko boleh membaca data TENANT MILIK SENDIRI
+      // (dipakai halaman "Toko Online" untuk menampilkan slug/deskripsi/
+      // status tampil saat ini) — bukan cuma superadmin.
+      if (!isSuper && id !== session.tid) throw new HttpError(403, 'Anda tidak memiliki izin melihat tenant ini.');
       const row = await db.prepare(`SELECT * FROM tenants WHERE id = ?`).bind(id).first();
       return json(row || null, row ? 200 : 404);
     }
+    if (!isSuper) throw new HttpError(403, 'Hanya superadmin yang boleh melihat daftar tenant.');
     const { results } = await db.prepare(`SELECT * FROM tenants`).all();
     return json(results);
   }
@@ -451,7 +485,8 @@ async function handleTenantsTable(request, env, id, session) {
     if (dupe) throw new HttpError(409, 'Kode Toko sudah dipakai, gunakan kode lain.');
 
     const now = new Date().toISOString();
-    const tenant = { id: genId('tnt'), kodeToko, nama, alamat, telepon, status: 'aktif', createdAt: now };
+    const slug = await autoSlugFromKodeToko(db, kodeToko);
+    const tenant = { id: genId('tnt'), kodeToko, nama, alamat, telepon, status: 'aktif', slug, deskripsi: null, tampilOnline: 1, createdAt: now };
     await insertRow(db, 'tenants', tenant);
 
     const passwordHash = await hashPassword(ownerPassword);
@@ -467,14 +502,29 @@ async function handleTenantsTable(request, env, id, session) {
   }
 
   if (method === 'PATCH' && id) {
-    if (!isSuper) throw new HttpError(403, 'Hanya superadmin yang boleh mengubah status tenant.');
     const existing = await db.prepare(`SELECT * FROM tenants WHERE id = ?`).bind(id).first();
     if (!existing) throw new HttpError(404, 'Tenant tidak ditemukan.');
     const body = await request.json().catch(() => ({}));
-    const status = body.status === 'nonaktif' ? 'nonaktif' : (body.status === 'aktif' ? 'aktif' : null);
-    if (!status) throw new HttpError(400, "Field 'status' harus 'aktif' atau 'nonaktif'.");
-    await updateRow(db, 'tenants', id, { status });
-    return json({ ...existing, status });
+
+    // [ECOMMERCE] Field pengaturan etalase publik (slug/deskripsi/tampilOnline)
+    // boleh diubah oleh superadmin ATAU pemilik toko itu sendiri. Field
+    // `status` (aktif/nonaktif tenant) TETAP khusus superadmin.
+    const isOwnerSelf = session.role === 'owner' && session.tid === id;
+    if (!isSuper && !isOwnerSelf) throw new HttpError(403, 'Anda tidak memiliki izin mengubah tenant ini.');
+
+    const patch = {};
+    if (isSuper && 'status' in body) {
+      const status = body.status === 'nonaktif' ? 'nonaktif' : (body.status === 'aktif' ? 'aktif' : null);
+      if (!status) throw new HttpError(400, "Field 'status' harus 'aktif' atau 'nonaktif'.");
+      patch.status = status;
+    }
+    if ('slug' in body) patch.slug = await normalizeSlug(db, body.slug, id);
+    if ('deskripsi' in body) patch.deskripsi = plainText(body.deskripsi, 300);
+    if ('tampilOnline' in body) patch.tampilOnline = body.tampilOnline ? 1 : 0;
+
+    if (!Object.keys(patch).length) throw new HttpError(400, 'Tidak ada field valid untuk diubah.');
+    await updateRow(db, 'tenants', id, patch);
+    return json({ ...existing, ...patch });
   }
 
   throw new HttpError(405, 'Method not allowed untuk tabel tenants.');
@@ -529,6 +579,113 @@ async function handlePublic(request, env) {
     return json({ token, user: sessionUserView(user, tenant) });
   }
 
+  // ------------------------------------------------------------
+  // [ECOMMERCE] Etalase belanja publik — TIDAK butuh sesi/login. Dipakai
+  // oleh pages/toko.js (pos.piawai.id/?toko dan /?toko/<slug>). Harga &
+  // validitas produk SELALU diambil ulang dari server di sini (bukan
+  // dari body yang dikirim klien) supaya pembeli anonim tidak bisa
+  // memanipulasi harga/produk milik toko lain lewat request palsu.
+  // ------------------------------------------------------------
+  if (view === 'toko-list' && request.method === 'GET') {
+    const { results } = await db.prepare(
+      `SELECT id, slug, nama, alamat, telepon, deskripsi FROM tenants
+       WHERE status = 'aktif' AND tampilOnline = 1 AND id != 'system'
+       ORDER BY nama ASC`
+    ).all();
+    return json(results);
+  }
+
+  if (view === 'toko-detail' && request.method === 'GET') {
+    const kunci = plainText(url.searchParams.get('toko'), 60).toLowerCase();
+    if (!kunci) throw new HttpError(400, "Parameter 'toko' wajib diisi.");
+
+    // Diterima baik lewat slug (link publik) maupun id tenant mentah
+    // (kompatibel ke belakang kalau link lama sempat dibagikan).
+    const tenant = await db.prepare(
+      `SELECT id, slug, nama, alamat, telepon, deskripsi, status FROM tenants
+       WHERE (slug = ? OR id = ?) AND id != 'system'`
+    ).bind(kunci, kunci).first();
+    if (!tenant || tenant.status !== 'aktif') throw new HttpError(404, 'Toko tidak ditemukan.');
+
+    const { results: produk } = await db.prepare(
+      `SELECT p.id, p.kode, p.nama, p.kategori, p.satuan, p.hargaJual,
+              COALESCE((SELECT SUM(lp.stok) FROM lokasi_produk lp WHERE lp.produkId = p.id), 0) AS stok
+       FROM produk p
+       WHERE p.tenantId = ? AND p.aktif = 1
+       ORDER BY p.nama ASC`
+    ).bind(tenant.id).all();
+
+    return json({
+      tenant: { id: tenant.id, slug: tenant.slug, nama: tenant.nama, alamat: tenant.alamat, telepon: tenant.telepon, deskripsi: tenant.deskripsi },
+      produk,
+    });
+  }
+
+  if (view === 'toko-pesan' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const kunci = plainText(body.toko, 60).toLowerCase();
+    if (!kunci) throw new HttpError(400, "Field 'toko' wajib diisi.");
+
+    // Rate limit per-IP — pembeli anonim, jadi tidak ada akun untuk dikunci.
+    const ipKey = `pesan:ip:${ip}`;
+    await rateLimitCheck(db, ipKey, { max: 15, windowMs: 60 * 60 * 1000, blockMs: 60 * 60 * 1000 });
+
+    const tenant = await db.prepare(`SELECT * FROM tenants WHERE (slug = ? OR id = ?) AND id != 'system'`).bind(kunci, kunci).first();
+    if (!tenant || tenant.status !== 'aktif') { await rateLimitHit(db, ipKey); throw new HttpError(404, 'Toko tidak ditemukan.'); }
+
+    const pembeliNama = plainText(body.pembeli?.nama, 120);
+    const pembeliTelepon = plainText(body.pembeli?.telepon, 40);
+    const pembeliAlamat = plainText(body.pembeli?.alamat, 240);
+    if (!pembeliNama || !pembeliTelepon) { await rateLimitHit(db, ipKey); throw new HttpError(400, 'Nama & telepon pembeli wajib diisi.'); }
+
+    const items = Array.isArray(body.items) ? body.items.slice(0, 50) : [];
+    if (!items.length) { await rateLimitHit(db, ipKey); throw new HttpError(400, 'Keranjang kosong.'); }
+
+    // [SECURITY] Harga & keberadaan produk diambil ULANG dari DB milik
+    // tenant ini saja — qty/produkId dari klien cuma dipakai sebagai
+    // "permintaan", tidak pernah dipercaya untuk harga.
+    const { results: produkRows } = await db.prepare(
+      `SELECT id, hargaJual FROM produk WHERE tenantId = ? AND aktif = 1`
+    ).bind(tenant.id).all();
+    const produkById = Object.fromEntries(produkRows.map(p => [p.id, p]));
+
+    const lines = [];
+    let total = 0;
+    for (const it of items) {
+      const p = produkById[it?.produkId];
+      const qty = Number(it?.qty);
+      if (!p || !Number.isFinite(qty) || qty <= 0) continue;
+      const hargaSatuan = p.hargaJual || 0;
+      const subtotal = qty * hargaSatuan;
+      lines.push({ produkId: p.id, qty, hargaSatuan, subtotal });
+      total += subtotal;
+    }
+    if (!lines.length) { await rateLimitHit(db, ipKey); throw new HttpError(400, 'Tidak ada produk valid pada pesanan.'); }
+
+    const lokasiTujuan =
+      await db.prepare(`SELECT id FROM lokasi WHERE tenantId = ? AND tipe = 'toko' ORDER BY createdAt ASC LIMIT 1`).bind(tenant.id).first() ||
+      await db.prepare(`SELECT id FROM lokasi WHERE tenantId = ? ORDER BY createdAt ASC LIMIT 1`).bind(tenant.id).first();
+    if (!lokasiTujuan) { await rateLimitHit(db, ipKey); throw new HttpError(400, 'Toko ini belum siap menerima pesanan online (belum ada lokasi).'); }
+
+    const now = new Date().toISOString();
+    const trx = {
+      id: genId('transaksi'), tenantId: tenant.id,
+      nomor: 'ON-' + Date.now().toString(36).toUpperCase(),
+      tipe: 'jual', tanggal: now.slice(0, 10), lokasiId: lokasiTujuan.id, kontakId: null,
+      status: 'draft', metodePembayaran: 'tunai', totalBayar: total,
+      catatan: 'Pesanan dari etalase toko online — menunggu konfirmasi.',
+      sumber: 'online', pembeliNama, pembeliTelepon, pembeliAlamat,
+      createdAt: now,
+    };
+    await insertRow(db, 'transaksi', trx);
+    for (const l of lines) {
+      await insertRow(db, 'transaksi_produk', { id: genId('tp'), tenantId: tenant.id, transaksiId: trx.id, ...l });
+    }
+
+    await rateLimitReset(db, ipKey);
+    return json({ id: trx.id, nomor: trx.nomor, total }, 201);
+  }
+
   if (view === 'register' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
     await verifyMathCaptcha(env, db, body.captchaToken, body.captchaAnswer, ip);
@@ -555,7 +712,8 @@ async function handlePublic(request, env) {
     if (dupe) { await rateLimitHit(db, regKey); throw new HttpError(409, 'Kode Toko sudah dipakai, gunakan kode lain.'); }
 
     const now = new Date().toISOString();
-    const tenant = { id: genId('tnt'), kodeToko, nama: namaToko, alamat, telepon, status: 'aktif', createdAt: now };
+    const slug = await autoSlugFromKodeToko(db, kodeToko);
+    const tenant = { id: genId('tnt'), kodeToko, nama: namaToko, alamat, telepon, status: 'aktif', slug, deskripsi: null, tampilOnline: 1, createdAt: now };
     await insertRow(db, 'tenants', tenant);
 
     const passwordHash = await hashPassword(password);

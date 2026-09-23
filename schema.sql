@@ -28,13 +28,22 @@ DROP TABLE IF EXISTS tenants;
 -- "kunci masuk" yang diketik pengguna saat login (lihat auth.js).
 -- ---------------------------------------------------------------
 CREATE TABLE tenants (
-  id        TEXT PRIMARY KEY,
-  kodeToko  TEXT UNIQUE NOT NULL,
-  nama      TEXT NOT NULL,
-  alamat    TEXT,
-  telepon   TEXT,
-  status    TEXT NOT NULL DEFAULT 'aktif',   -- aktif | nonaktif
-  createdAt TEXT NOT NULL
+  id           TEXT PRIMARY KEY,
+  kodeToko     TEXT UNIQUE NOT NULL,
+  nama         TEXT NOT NULL,
+  alamat       TEXT,
+  telepon      TEXT,
+  status       TEXT NOT NULL DEFAULT 'aktif',   -- aktif | nonaktif
+  -- [ECOMMERCE] Etalase publik toko (lihat worker.js view=toko-*):
+  --   slug         -> bagian link publik, mis. https://pos.piawai.id/?toko/jaya
+  --   deskripsi    -> ditampilkan di halaman katalog publik
+  --   tampilOnline -> 1 = muncul di daftar "?toko", 0 = etalase disembunyikan
+  --                   (link langsung ke slug tetap bisa dibuka pemilik sendiri
+  --                   untuk pratinjau walau belum "aktif" dipromosikan)
+  slug         TEXT UNIQUE,
+  deskripsi    TEXT,
+  tampilOnline INTEGER NOT NULL DEFAULT 1,
+  createdAt    TEXT NOT NULL
 );
 
 -- [SECURITY] password disimpan sebagai hash PBKDF2-SHA256 (salt per-user),
@@ -137,6 +146,15 @@ CREATE TABLE transaksi (
   metodePembayaran TEXT DEFAULT 'tunai',      -- tunai | qris
   totalBayar       REAL DEFAULT 0,
   catatan          TEXT,
+  -- [ECOMMERCE] Pesanan dari etalase publik (worker.js view=toko-pesan)
+  -- masuk sebagai transaksi tipe='jual', status='draft', sumber='online'.
+  -- Pembeli publik TIDAK punya akun/kontak, jadi datanya disimpan lepas
+  -- di sini (bukan kontakId) — dibaca kasir/pemilik di layar Konfirmasi
+  -- Pesanan (pages/transaksi.js) sebelum stok & jurnal diproses.
+  sumber           TEXT NOT NULL DEFAULT 'pos',   -- pos | online
+  pembeliNama      TEXT,
+  pembeliTelepon   TEXT,
+  pembeliAlamat    TEXT,
   createdAt        TEXT NOT NULL
 );
 CREATE INDEX idx_transaksi_tenant ON transaksi(tenantId);
@@ -229,9 +247,9 @@ CREATE TABLE rate_limit (
 -- Untuk deployment sungguhan, GANTI seed ini dengan hash baru:
 --   node tools/hash-password.mjs "password-anda"
 -- ============================================================
-INSERT INTO tenants (id, kodeToko, nama, alamat, telepon, status, createdAt) VALUES
- ('system',   'SUPERADMIN', 'Sistem (Superadmin)',   '-', '-', 'aktif', datetime('now')),
- ('tnt_demo', 'TOKO001',    'Toko Sembako Makmur',   'Jl. Merdeka No. 1', '081200000000', 'aktif', datetime('now'));
+INSERT INTO tenants (id, kodeToko, nama, alamat, telepon, status, slug, deskripsi, tampilOnline, createdAt) VALUES
+ ('system',   'SUPERADMIN', 'Sistem (Superadmin)',   '-', '-', 'aktif', NULL, NULL, 0, datetime('now')),
+ ('tnt_demo', 'TOKO001',    'Toko Sembako Makmur',   'Jl. Merdeka No. 1', '081200000000', 'aktif', 'toko001', 'Sembako harian lengkap & harga bersahabat.', 1, datetime('now'));
 
 -- Placeholder hash — WAJIB diganti sebelum deploy produksi. Jalankan
 -- `node tools/hash-password.mjs <password>` lalu tempel hasilnya ke
