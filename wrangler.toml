@@ -5,7 +5,7 @@ compatibility_date = "2024-09-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "pos-db"
-database_id = "7073997b-8b46-4a84-bcdb-e0103c283d20"
+database_id = "ae2fa1c1-7c8b-41b4-8085-5288e6b1c022"
 
 # [SECURITY] Origin frontend yang diizinkan CORS (pisahkan dgn koma kalau
 # lebih dari satu). Kalau tidak di-set, worker.js jatuh ke DEFAULT_ORIGINS
