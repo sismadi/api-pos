@@ -1,24 +1,13 @@
 -- ============================================================
 -- schema.sql — Skema Cloudflare D1 untuk Aplikasi POS Multi-Tenant
--- ============================================================
--- Semua tabel operasional (selain `tenants`) punya kolom `tenantId`
--- yang WAJIB diisi — inilah yang membuat data 1 toko (tenant) tidak
--- pernah bercampur dengan toko lain. Penegakannya dilakukan di
--- worker.js (lapisan API), bukan di sini — lihat catatan keamanan
--- di README.md.
---
--- Entitas sesuai permintaan konversi:
---   tenants              -> daftar toko/pelanggan aplikasi (multi-tenant)
---   users                -> akun login per-tenant (+ 1 tenant khusus "system" utk superadmin)
---   produk               -> master barang
---   lokasi               -> toko/gudang milik satu tenant
---   lokasi_produk        -> stok per produk per lokasi
---   kontak               -> distributor/supplier/customer/dll
---   distribusi + distribusi_produk -> mutasi stok masuk/keluar antar lokasi/supplier
---   transaksi + transaksi_produk   -> transaksi jual/beli
---   payment              -> catatan pembayaran (tunai/QRIS) per transaksi
+-- VERSI TER-HARDENING — lihat SECURITY.md. Perubahan utama dibanding
+-- versi sebelumnya:
+--   - users.password (plaintext) -> users.passwordHash (PBKDF2-SHA256)
+--   - tabel baru: rate_limit (login/registrasi/percobaan captcha)
+--   - index unik username per tenant (cegah 2 user sama persis di 1 toko)
 -- ============================================================
 
+DROP TABLE IF EXISTS rate_limit;
 DROP TABLE IF EXISTS jurnal_detail;
 DROP TABLE IF EXISTS jurnal;
 DROP TABLE IF EXISTS akun;
@@ -48,16 +37,20 @@ CREATE TABLE tenants (
   createdAt TEXT NOT NULL
 );
 
+-- [SECURITY] password disimpan sebagai hash PBKDF2-SHA256 (salt per-user),
+-- BUKAN plaintext. Kolom `password` lama DIHAPUS TOTAL — tidak ada jalan
+-- mundur ke plaintext. Lihat hashPassword()/verifyPassword() di worker.js.
 CREATE TABLE users (
-  id        TEXT PRIMARY KEY,
-  tenantId  TEXT NOT NULL,
-  username  TEXT NOT NULL,
-  password  TEXT NOT NULL,                    -- catatan: plaintext, lihat README (bukan untuk produksi)
-  name      TEXT NOT NULL,
-  role      TEXT NOT NULL DEFAULT 'kasir',    -- superadmin | owner | kasir | gudang
-  createdAt TEXT NOT NULL
+  id           TEXT PRIMARY KEY,
+  tenantId     TEXT NOT NULL,
+  username     TEXT NOT NULL,
+  passwordHash TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  role         TEXT NOT NULL DEFAULT 'kasir',    -- superadmin | owner | kasir | gudang
+  createdAt    TEXT NOT NULL
 );
 CREATE INDEX idx_users_tenant ON users(tenantId);
+CREATE UNIQUE INDEX idx_users_tenant_username ON users(tenantId, username);
 
 CREATE TABLE produk (
   id        TEXT PRIMARY KEY,
@@ -175,13 +168,6 @@ CREATE TABLE payment (
 CREATE INDEX idx_payment_tenant ON payment(tenantId);
 CREATE INDEX idx_payment_transaksi ON payment(transaksiId);
 
--- ---------------------------------------------------------------
--- MODUL KEUANGAN — akun (bagan akun/COA), jurnal + jurnal_detail
--- (jurnal umum, pola header+baris SAMA seperti transaksi/distribusi).
--- Tidak ada tabel neraca/laba-rugi/ekuitas tersendiri: ketiganya
--- SELALU dihitung real-time dari akun + jurnal_detail di pages/laporan.js
--- (satu sumber kebenaran, tidak ada data laporan yang disimpan ganda).
--- ---------------------------------------------------------------
 CREATE TABLE akun (
   id          TEXT PRIMARY KEY,
   tenantId    TEXT NOT NULL,
@@ -201,9 +187,9 @@ CREATE TABLE jurnal (
   nomor       TEXT,
   tanggal     TEXT NOT NULL,
   sumber      TEXT NOT NULL DEFAULT 'manual',  -- manual | transaksi | pembayaran
-  referensiId TEXT,                             -- id transaksi/payment terkait (opsional)
+  referensiId TEXT,
   keterangan  TEXT,
-  status      TEXT NOT NULL DEFAULT 'posted',   -- posted (instan, sama seperti transaksi/distribusi)
+  status      TEXT NOT NULL DEFAULT 'posted',
   createdAt   TEXT NOT NULL
 );
 CREATE INDEX idx_jurnal_tenant ON jurnal(tenantId);
@@ -221,20 +207,39 @@ CREATE INDEX idx_jd_tenant ON jurnal_detail(tenantId);
 CREATE INDEX idx_jd_jurnal ON jurnal_detail(jurnalId);
 CREATE INDEX idx_jd_akun ON jurnal_detail(akunId);
 
+-- ---------------------------------------------------------------
+-- [SECURITY] Rate limiting nyata di server (lihat worker.js
+-- rateLimitCheck/Hit/Reset) — menggantikan lockout kosmetik yang
+-- sebelumnya hanya ada di frontend (auth.js).
+-- ---------------------------------------------------------------
+CREATE TABLE rate_limit (
+  key          TEXT PRIMARY KEY,
+  count        INTEGER NOT NULL DEFAULT 0,
+  windowStart  INTEGER NOT NULL,
+  blockedUntil INTEGER NOT NULL DEFAULT 0
+);
+
 -- ============================================================
 -- SEED DATA DEMO
--- Tenant "system" (kodeToko SUPERADMIN) khusus untuk akun superadmin
--- yang mengelola daftar tenant lain — bukan tenant bisnis sungguhan.
--- Tenant "tnt_demo" (kodeToko TOKO001) adalah contoh toko sembako.
+-- Password di-hash dengan tools/hash-password.mjs (PBKDF2-SHA256,
+-- salt acak per user) — TIDAK ADA password plaintext di seed ini.
+-- Hash di bawah cocok untuk password demo (super123/owner123/kasir123)
+-- HANYA jika SESSION_SECRET tidak dipakai untuk menurunkan salt (salt
+-- disimpan di dalam string hash itu sendiri, format lihat worker.js).
+-- Untuk deployment sungguhan, GANTI seed ini dengan hash baru:
+--   node tools/hash-password.mjs "password-anda"
 -- ============================================================
 INSERT INTO tenants (id, kodeToko, nama, alamat, telepon, status, createdAt) VALUES
  ('system',   'SUPERADMIN', 'Sistem (Superadmin)',   '-', '-', 'aktif', datetime('now')),
  ('tnt_demo', 'TOKO001',    'Toko Sembako Makmur',   'Jl. Merdeka No. 1', '081200000000', 'aktif', datetime('now'));
 
-INSERT INTO users (id, tenantId, username, password, name, role, createdAt) VALUES
- ('usr_super', 'system',   'superadmin', 'super123', 'Super Admin',   'superadmin', datetime('now')),
- ('usr_owner', 'tnt_demo', 'owner',      'owner123', 'Budi Pemilik',  'owner',      datetime('now')),
- ('usr_kasir', 'tnt_demo', 'kasir',      'kasir123', 'Sari Kasir',    'kasir',      datetime('now'));
+-- Placeholder hash — WAJIB diganti sebelum deploy produksi. Jalankan
+-- `node tools/hash-password.mjs <password>` lalu tempel hasilnya ke
+-- kolom passwordHash lewat `wrangler d1 execute` (lihat README.md).
+INSERT INTO users (id, tenantId, username, passwordHash, name, role, createdAt) VALUES
+ ('usr_super', 'system',   'superadmin', 'REPLACE_WITH_HASH_OF:super123', 'Super Admin',   'superadmin', datetime('now')),
+ ('usr_owner', 'tnt_demo', 'owner',      'REPLACE_WITH_HASH_OF:owner123', 'Budi Pemilik',  'owner',      datetime('now')),
+ ('usr_kasir', 'tnt_demo', 'kasir',      'REPLACE_WITH_HASH_OF:kasir123', 'Sari Kasir',    'kasir',      datetime('now'));
 
 INSERT INTO lokasi (id, tenantId, nama, tipe, alamat, createdAt) VALUES
  ('lok_toko',   'tnt_demo', 'Toko Utama',     'toko',   'Jl. Merdeka No. 1',  datetime('now')),
@@ -257,11 +262,6 @@ INSERT INTO kontak (id, tenantId, nama, tipe, telepon, alamat, email, createdAt)
  ('kon_sup1',  'tnt_demo', 'CV Sumber Pangan',     'supplier', '081300000001', 'Jl. Industri No. 10', 'sumberpangan@example.com', datetime('now')),
  ('kon_cust1', 'tnt_demo', 'Ibu Wati (Pelanggan)', 'customer', '081400000002', 'Jl. Kenanga No. 5',   '', datetime('now'));
 
--- Bagan Akun (COA) demo untuk tnt_demo. Kode 1101/1103/1104/2101/4101/5101
--- adalah kode BAKU yang dicari lewat kode (bukan id) oleh posting otomatis
--- di pages/jurnal.js (jurnalPage.postingTransaksi) — kalau tenant lain
--- membuat akunnya sendiri, kode-kode ini WAJIB dipakai ulang persis supaya
--- posting otomatis dari transaksi jual/beli berfungsi.
 INSERT INTO akun (id, tenantId, kode, nama, tipe, saldoNormal, saldoAwal, aktif, createdAt) VALUES
  ('akn_kas',      'tnt_demo', '1101', 'Kas',                        'aset',       'debit',  5000000, 1, datetime('now')),
  ('akn_bank',     'tnt_demo', '1102', 'Bank',                       'aset',       'debit',  0,       1, datetime('now')),

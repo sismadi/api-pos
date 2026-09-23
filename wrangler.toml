@@ -7,7 +7,23 @@ binding = "DB"
 database_name = "pos-db"
 database_id = "7073997b-8b46-4a84-bcdb-e0103c283d20"
 
+# [SECURITY] Origin frontend yang diizinkan CORS (pisahkan dgn koma kalau
+# lebih dari satu). Kalau tidak di-set, worker.js jatuh ke DEFAULT_ORIGINS
+# (localhost) — GANTI untuk produksi.
+[vars]
+ALLOWED_ORIGINS = "https://pos.piawai.id"
+
 # Setelah membuat database:
 #   wrangler d1 create pos_multi_tenant
 #   wrangler d1 execute pos_multi_tenant --file=./schema.sql
+#
+# [SECURITY] WAJIB sebelum deploy — secret penandatangan sesi & captcha:
+#   wrangler secret put SESSION_SECRET
+#   (isi dengan string acak panjang, mis. `openssl rand -base64 32`)
+#
+# [SECURITY] WAJIB sebelum deploy — ganti hash password seed demo
+# (lihat catatan di schema.sql) memakai hash-password.mjs:
+#   node hash-password.mjs "password-baru-anda"
+#   wrangler d1 execute pos_multi_tenant --remote --command "UPDATE users SET passwordHash='...' WHERE id='usr_owner';"
+#
 #   wrangler deploy
